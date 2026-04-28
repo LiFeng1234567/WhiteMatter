@@ -1,0 +1,145 @@
+# ==================== Random Forest Classification: Visual Fibers ====================
+# Purpose: Classify four fiber types (commissure, OVF, SS) based on single-cell spatial transcriptomics data.
+# Strategy: One-vs-Rest binary classification, one random forest per class.
+# ===================================================================================
+
+# 1. Load required packages ------------------------------------------------------------
+library(randomForest)
+library(caret)          # createDataPartition, upSample
+library(pROC)           # ROC curves and AUC
+library(MLmetrics)      # Accuracy, F1_Score, AUC, PRAUC
+library(dplyr)          # data manipulation
+library(Seurat)         # Seurat object handling
+
+# 2. Load and preprocess data ------------------------------------------------------------
+seurat <- readRDS("xx/integrated_bin200_WM_visfibers_intra_250622.rds")
+
+# Subset target fiber types
+target_fibers <- c("inferior_forceps", "occipital_vertical_fasciculus", 
+                   "sagittal_stratum", "tapetum")
+seurat <- subset(seurat, area %in% target_fibers)
+
+# Merge inferior_forceps and tapetum into "Commissure"
+seurat$area <- ifelse(seurat$area %in% c("inferior_forceps", "tapetum"), 
+                      "Commissure", seurat$area)
+
+# Extract count matrix and metadata
+counts <- as.matrix(seurat@assays$RNA@counts)
+cell_metadata <- seurat@meta.data
+
+# Construct training data frame: CellID, Sample, CellType, gene expression
+cell_data <- data.frame(
+  CellID = rownames(cell_metadata),
+  Sample = cell_metadata$orig.ident,
+  CellType = cell_metadata$area,
+  t(counts),
+  stringsAsFactors = FALSE
+)
+
+# 3. Feature selection: differentially expressed genes + high variance genes --------------
+deg <- read.csv("xx/marmoset_gliaall_rankgenegroups_251111_150_nonME.csv", 
+                row.names = 1, stringsAsFactors = FALSE)
+
+# Keep only genes present in the DEG list
+geneid <- intersect(deg$x, colnames(cell_data))
+cell_data <- cell_data[, c("CellID", "Sample", "CellType", geneid)]
+
+# Calculate gene expression variance, keep highly variable genes (threshold = 0.5)
+var_threshold <- 0.5
+gene_vars <- apply(cell_data[, -c(1:3)], 2, var)
+high_var_genes <- names(gene_vars[gene_vars > var_threshold])
+cat("Number of high-variance genes retained:", length(high_var_genes), "\n")
+
+# Final feature matrix: only high-variance genes
+cell_data <- cell_data[, c("CellID", "Sample", "CellType", high_var_genes)]
+
+# 4. Train/test split (80% / 20%) --------------------------------------------------------
+set.seed(123)
+train_idx <- createDataPartition(cell_data$CellType, p = 0.8, list = FALSE)
+train_data <- cell_data[train_idx, ]
+test_data  <- cell_data[-train_idx, ]
+
+# Check class distribution
+cat("Training set class proportions:\n"); print(prop.table(table(train_data$CellType)))
+cat("Test set class proportions:\n"); print(prop.table(table(test_data$CellType)))
+
+# 5. Define function to train a binary random forest model (One-vs-Rest) ----------------
+train_rf_model <- function(train_df, class_label, feature_genes, ntree = 1000, mtry = NULL) {
+  # Create binary labels
+  train_df <- train_df %>%
+    mutate(BinaryLabel = factor(ifelse(CellType == class_label, "Positive", "Negative")))
+  
+  # Upsample to balance Positive/Negative
+  set.seed(123)
+  balanced <- upSample(
+    x = train_df[, feature_genes, drop = FALSE],
+    y = train_df$BinaryLabel,
+    yname = "BinaryLabel"
+  )
+  balanced$BinaryLabel <- as.factor(balanced$BinaryLabel)
+  
+  # Set mtry (default = sqrt(number of features))
+  if (is.null(mtry)) mtry <- floor(sqrt(length(feature_genes)))
+  
+  # Train random forest
+  set.seed(123)
+  rf <- randomForest(
+    BinaryLabel ~ .,
+    data = balanced[, c(feature_genes, "BinaryLabel")],
+    ntree = ntree,
+    mtry = mtry,
+    importance = TRUE,
+    do.trace = 100
+  )
+  return(rf)
+}
+
+# 6. Train models for each cell type ----------------------------------------------------
+cell_types <- unique(cell_data$CellType)
+models <- list()
+auc_values <- list()
+
+for (ct in cell_types) {
+  cat("\n===== Training model for:", ct, " (vs Others) =====\n")
+  model <- train_rf_model(train_data, class_label = ct, 
+                          feature_genes = high_var_genes,
+                          ntree = 1000)
+  models[[ct]] <- model
+  
+  # Predict on test set
+  test_pred_prob <- predict(model, newdata = test_data[, high_var_genes], type = "prob")[, "Positive"]
+  test_labels <- ifelse(test_data$CellType == ct, "Positive", "Negative")
+  test_labels <- factor(test_labels, levels = c("Positive", "Negative"))
+  
+  roc_obj <- roc(test_labels, test_pred_prob)
+  auc_val <- auc(roc_obj)
+  auc_values[[ct]] <- auc_val
+  cat("Test set AUC:", auc_val, "\n")
+}
+
+# 7. Model evaluation metrics (Accuracy, F1, AUC, AUPR) --------------------------------
+evaluate_model <- function(pred_prob, true_labels, threshold = 0.5) {
+  # true_labels should be a factor with levels "Positive"/"Negative"
+  true_numeric <- ifelse(true_labels == "Positive", 1, 0)
+  pred_class <- ifelse(pred_prob > threshold, 1, 0)
+  
+  acc <- Accuracy(pred_class, true_numeric)
+  f1 <- F1_Score(true_numeric, pred_class)
+  auc_val <- AUC(pred_prob, true_numeric)
+  aupr <- PRAUC(pred_prob, true_numeric)
+  
+  return(c(Accuracy = acc, F1_Score = f1, AUC = auc_val, AUPR = aupr))
+}
+
+# Compute metrics for each model
+metrics_summary <- data.frame()
+for (ct in cell_types) {
+  model <- models[[ct]]
+  test_pred_prob <- predict(model, newdata = test_data[, high_var_genes], type = "prob")[, "Positive"]
+  test_labels <- ifelse(test_data$CellType == ct, "Positive", "Negative")
+  test_labels <- factor(test_labels, levels = c("Positive", "Negative"))
+  
+  metrics <- evaluate_model(test_pred_prob, test_labels)
+  metrics_summary <- rbind(metrics_summary, data.frame(CellType = ct, t(metrics)))
+}
+print(metrics_summary)
