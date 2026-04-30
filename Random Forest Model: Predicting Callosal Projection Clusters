@@ -1,0 +1,146 @@
+# ============================================================
+# Random Forest Model: Predicting Callosal Projection Clusters (eg1, eg2, eg3)
+# Based on UMAP clustering of spatial bins in the corpus callosum
+# ============================================================
+
+# 1. Load required packages
+library(Seurat)
+library(randomForest)
+library(caret)          # createDataPartition, upSample
+library(pROC)           # roc, auc
+library(MLmetrics)      # Accuracy, F1_Score, AUC, PRAUC
+library(dplyr)          # data manipulation
+
+# 2. Load data
+seurat <- readRDS("xx/8samples_seurat_integrated_bin1_250428.rds")
+load("xx/cc_projection_umap.RData")  # loads object 'df1'
+
+# 3. k-means clustering on UMAP coordinates to define 3 projection clusters (eg1, eg2, eg3)
+umap_data <- as.data.frame(df1)
+colnames(umap_data)[1:2] <- c("UMAP1", "UMAP2")
+
+set.seed(123)
+kmeans_result <- kmeans(umap_data[, c("UMAP1", "UMAP2")], centers = 3)
+umap_data$Cluster <- paste0("eg", kmeans_result$cluster)   # renamed to eg1, eg2, eg3
+umap_data <- na.omit(umap_data)
+
+# Add cluster labels to Seurat object
+seurat <- AddMetaData(seurat, metadata = umap_data$Cluster, col.name = "Cluster")
+
+# 4. Build training data frame (bins × gene expression matrix)
+data <- as.matrix(seurat@assays$RNA@counts)
+cell_data <- data.frame(
+  CellID = rownames(seurat@meta.data),
+  Sample = seurat@meta.data$orig.ident,
+  CellType = seurat@meta.data$Cluster,   # now contains eg1, eg2, eg3
+  t(data),
+  stringsAsFactors = FALSE
+)
+
+# 5. Feature selection: highly variable genes (variance > 0.5)
+var_threshold <- 0.5
+feature_vars <- apply(cell_data[, 4:ncol(cell_data)], 2, var, na.rm = TRUE)
+high_var_features <- names(feature_vars[feature_vars > var_threshold])
+cat("Number of high-variance features retained:", length(high_var_features), "\n")
+
+cell_data <- cell_data[, c("CellID", "Sample", "CellType", high_var_features)]
+
+# 6. Train/test split (80% / 20%)
+set.seed(123)
+train_index <- createDataPartition(cell_data$CellType, p = 0.8, list = FALSE)
+train_data <- cell_data[train_index, ]
+test_data  <- cell_data[-train_index, ]
+
+cat("Training set cell type distribution:\n"); print(prop.table(table(train_data$CellType)))
+cat("\nTest set cell type distribution:\n"); print(prop.table(table(test_data$CellType)))
+
+cell_types <- unique(cell_data$CellType)
+cat("Cell types:", paste(cell_types, collapse = ", "), "\n")
+
+# 7. Define evaluation function (outside the loop)
+calculate_metrics_MLmetrics <- function(predictions, true_labels, dataset_name = "Dataset") {
+  cat("=== Debug info:", dataset_name, "===\n")
+  cat("Prediction probability range:", range(predictions), "\n")
+  cat("True label distribution:", table(true_labels), "\n")
+  
+  true_numeric <- ifelse(true_labels == "Positive", 1, 0)
+  pred_class   <- ifelse(predictions > 0.5, 1, 0)
+  
+  acc  <- Accuracy(pred_class, true_numeric)
+  f1   <- F1_Score(true_numeric, pred_class)
+  auc  <- AUC(predictions, true_numeric)
+  aupr <- PRAUC(predictions, true_numeric)
+  
+  cat("Accuracy:", acc, "  F1-score:", f1, "  AUC:", auc, "  AUPR:", aupr, "\n\n")
+  
+  return(c(Accuracy = acc, F1_Score = f1, AUC_ROC = auc, AUPR = aupr))
+}
+
+# 8. Train One-vs-Rest random forest models for each projection cluster (eg1, eg2, eg3)
+models <- list()
+auc_values <- list()
+train_metrics <- list()
+test_metrics  <- list()
+
+for (ct in cell_types) {
+  cat("\n===== Training model for:", ct, " (vs Others) =====\n")
+  
+  # Create binary labels
+  train_data_binary <- train_data
+  train_data_binary$BinaryLabel <- factor(ifelse(train_data$CellType == ct, "Positive", "Negative"))
+  test_data_binary <- test_data
+  test_data_binary$BinaryLabel <- factor(ifelse(test_data$CellType == ct, "Positive", "Negative"))
+  
+  # Upsample to balance Positive/Negative
+  set.seed(123)
+  balanced_train <- upSample(
+    x = train_data_binary[, -c(1:3, ncol(train_data_binary))],
+    y = train_data_binary$BinaryLabel,
+    yname = "BinaryLabel"
+  )
+  balanced_train <- cbind(balanced_train,
+                          train_data_binary[as.numeric(rownames(balanced_train)), c("CellID", "Sample", "CellType")])
+  
+  # Train random forest
+  set.seed(123)
+  rf_model <- randomForest(
+    BinaryLabel ~ .,
+    data = balanced_train[, -which(colnames(balanced_train) %in% c("CellID", "Sample", "CellType"))],
+    ntree = 1000,
+    mtry = sqrt(length(high_var_features)),
+    importance = TRUE,
+    do.trace = 100
+  )
+  models[[ct]] <- rf_model
+  
+  # Predict on training and test sets
+  train_pred <- predict(rf_model,
+                        newdata = train_data_binary[, -c(1:3, ncol(train_data_binary))],
+                        type = "prob")
+  test_pred <- predict(rf_model,
+                       newdata = test_data_binary[, -c(1:3, ncol(test_data_binary))],
+                       type = "prob")
+  
+  # Compute AUC
+  roc_obj <- roc(test_data_binary$BinaryLabel, test_pred[, "Positive"])
+  auc_val <- auc(roc_obj)
+  auc_values[[ct]] <- auc_val
+  cat("Test set AUC:", auc_val, "\n")
+  
+  # Compute evaluation metrics
+  train_metrics[[ct]] <- calculate_metrics_MLmetrics(train_pred[, "Positive"],
+                                                      train_data_binary$BinaryLabel,
+                                                      paste0("Training Set - ", ct))
+  test_metrics[[ct]]  <- calculate_metrics_MLmetrics(test_pred[, "Positive"],
+                                                      test_data_binary$BinaryLabel,
+                                                      paste0("Test Set - ", ct))
+}
+
+# 9. Summarize test metrics for all clusters
+metrics_summary <- do.call(rbind, lapply(names(test_metrics), function(ct) {
+  data.frame(Cluster = ct, t(test_metrics[[ct]]))
+}))
+print(metrics_summary)
+
+# 10. Save results (optional)
+save.image("xx/projection_rf_model_results.RData")
