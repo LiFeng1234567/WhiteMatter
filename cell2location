@@ -1,0 +1,135 @@
+import scanpy as sc
+import anndata
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+import cell2location
+import scvi
+
+from matplotlib import rcParams
+import os
+os.environ["THEANO_FLAGS"] = 'device=gpu,floatX=float32,openmp=True,force_device=True'
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--results_folder', type=str)
+parser.add_argument('--adata_vis', type=str)
+parser.add_argument('--adata_ref', type=str)
+parser.add_argument('--slice', type=str)
+args = parser.parse_args()
+
+
+results_folder =  args.results_folder# '/cluster/home/yangqianqian/cerebllum/marmoset/T686/results/'
+ref_run_name = f'{results_folder}/reference_signatures'
+run_name = f'{results_folder}/cell2location_map'
+
+
+adata_vis = sc.read(args.adata_vis)
+adata_vis.obs['slice'] = args.slice
+#adata_vis.var_names = list(adata_vis.var['_index'].values)
+
+adata_vis.var['SYMBOL'] = adata_vis.var_names
+
+adata_vis.var['MT_gene'] = [gene.startswith('MT-') for gene in adata_vis.var['SYMBOL']]
+adata_vis.obsm['MT'] = adata_vis[:, adata_vis.var['MT_gene'].values].X.toarray()
+adata_vis = adata_vis[:, ~adata_vis.var['MT_gene'].values]
+
+
+adata_ref = sc.read(args.adata_ref)
+adata_ref.var['SYMBOL'] = adata_ref.var_names
+from cell2location.utils.filtering import filter_genes
+selected = filter_genes(adata_ref, cell_count_cutoff=5, cell_percentage_cutoff2=0.03, nonz_mean_cutoff=1.12)
+
+adata_ref = adata_ref[:, selected].copy()
+
+cell2location.models.RegressionModel.setup_anndata(adata=adata_ref,
+                        # 10X reaction / sample / batch
+                        batch_key='IL11_batch',
+                        # cell type, covariate used for constructing signatures
+                        labels_key='IL15_annotation',
+                        # multiplicative technical effects (platform, 3' vs 5', donor effect)
+#                         categorical_covariate_keys=['Method']
+                       )
+
+
+
+from cell2location.models import RegressionModel
+mod = RegressionModel(adata_ref)
+
+
+mod.view_anndata_setup()
+
+mod.train(max_epochs=100,batch_size=1000, train_size=1, lr=0.002,use_gpu=True)
+
+
+adata_ref = mod.export_posterior(
+    adata_ref, sample_kwargs={'num_samples': 1000, 'batch_size': 1000, 'use_gpu': True}
+)
+
+# Save model
+mod.save(f"{ref_run_name}", overwrite=True)
+
+# Save anndata object with results
+adata_file = f"{ref_run_name}/sc.h5ad"
+adata_ref._raw._var.rename(columns={'_index': 'features'}, inplace=True)
+adata_ref.write(adata_file)
+adata_file
+
+if 'means_per_cluster_mu_fg' in adata_ref.varm.keys():
+    inf_aver = adata_ref.varm['means_per_cluster_mu_fg'][[f'means_per_cluster_mu_fg_{i}'
+                                    for i in adata_ref.uns['mod']['factor_names']]].copy()
+else:
+    inf_aver = adata_ref.var[[f'means_per_cluster_mu_fg_{i}'
+                                    for i in adata_ref.uns['mod']['factor_names']]].copy()
+inf_aver.columns = adata_ref.uns['mod']['factor_names']
+inf_aver.iloc[0:5, 0:5]
+
+
+intersect = np.intersect1d(adata_vis.var_names, inf_aver.index)
+adata_vis = adata_vis[:, intersect].copy()
+inf_aver = inf_aver.loc[intersect, :].copy()
+
+
+cell2location.models.Cell2location.setup_anndata(adata=adata_vis, batch_key="slice")
+
+mod = cell2location.models.Cell2location(
+    adata_vis, cell_state_df=inf_aver,
+    # the expected average cell abundance: tissue-dependent
+    # hyper-prior which can be estimated from paired histology:
+    N_cells_per_location=1.1,
+    # hyperparameter controlling normalisation of
+    # within-experiment variation in RNA detection:
+    detection_alpha=20
+)
+print("mod_finished")
+
+mod.train(max_epochs=150,
+          # train using full data (batch_size=None)
+          batch_size=1000,
+          # use all data points in training because
+          # we need to estimate cell abundance at all locations
+          train_size=1,
+          use_gpu=True)
+print("2F")
+
+
+adata_vis = mod.export_posterior(
+    adata_vis,  use_quantiles=True,
+    # choose quantiles
+    add_to_obsm=["q05","q50", "q95", "q0001"],
+    sample_kwargs={ 'batch_size':1000}#, 'use_gpu': True}
+)
+print("3F")
+mod.save(f"{run_name}", overwrite=True)
+adata_file = f"{run_name}/sp.h5ad"
+#adata_vis._raw._var.rename(columns={'_index': 'features'}, inplace=True)
+print("4F")
+adata_vis.write(adata_file)
+print("5F")
+#adata_file
+adata_vis.obs[adata_vis.uns['mod']['factor_names']] = adata_vis.obsm['q05_cell_abundance_w_sf']
+adata_file1 = f"{run_name}/sp1.h5ad"
+adata_vis.write(adata_file1)
