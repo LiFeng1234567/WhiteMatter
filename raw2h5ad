@@ -1,0 +1,42 @@
+import scanpy as sc 
+import pandas as pd 
+import numpy as np
+from collections import defaultdict
+import sys 
+path1 = sys.argv[1]
+path2 = sys.argv[2]
+path3 = sys.argv[3]
+#path1="xx/total_gene_T915_macaque_f001_2D_20230512-macaque-Mq277-barcode-wml.txt"
+#path2 = "xx/T915.h5ad" 
+df = pd.read_csv(path1,sep = "\t",header=0)
+print(df.shape)
+df = df[df["cell_label"]!=0]
+print(df.shape)
+df.dropna(inplace=True)
+print(df.shape)
+pos_df = pd.read_csv(path3) 
+label_set = set(pos_df['cell_id'].unique())
+filtered_df = df[df['cell_label'].isin(label_set)]
+print(f"过滤后形状: {filtered_df.shape}")
+print(f"\n值分布统计:")
+print(filtered_df['umi_count'].describe())
+location = filtered_df[["cell_label", "x", "y"]]
+location = location.groupby("cell_label").mean()
+location.index = location.index.astype(str)
+    
+g = filtered_df.groupby(['gene', 'cell_label'])['umi_count'].sum()
+g = g.to_frame().reset_index()
+g = g[g.groupby('gene')['gene'].transform('size') > 2]
+g = g.pivot(index=['cell_label'],
+            columns=['gene'],
+            values=['umi_count']).fillna(0)
+a=g.columns.levels[1]
+g.columns=a
+adata = sc.AnnData(g)
+adata.obs["x"] = location["x"].astype(np.int32)
+adata.obs["y"] = location["y"].astype(np.int32)
+adata.obs.index = adata.obs.index.astype("str")
+adata.var = adata.var.reset_index(drop = False)
+adata.var = adata.var.set_index("gene")
+#del adata.var['level_0']
+adata.write(path2)
