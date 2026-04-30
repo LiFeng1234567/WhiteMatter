@@ -1,0 +1,144 @@
+# ============================================================
+# Random Forest Model: Optic Tract vs Other White Matter Tracts
+# Based on spatial transcriptomics bin200 data (intra-cellular)
+# ============================================================
+
+# 1. Load required packages ------------------------------------------------
+library(caret)          # createDataPartition, upSample
+library(pROC)           # roc, auc
+library(randomForest)
+library(dplyr)          # data manipulation
+library(Seurat)
+library(MLmetrics)      # Accuracy, F1_Score, AUC, PRAUC
+
+# 2. Read DEG list for optic tract (mOLG3/4) -------------------------------
+deg_file <- "xx/DEG_MAST - OLI12_wm_88samples_nfs_aftercluster-parameter-only_label4 - Optic Tract_vs_other.csv"
+deg_df <- read.csv(deg_file)
+optic_genes <- deg_df$gene   # candidate feature genes
+
+# 3. Load Seurat object and subset to sagittal/coronal sections ----------
+seurat_obj <- readRDS("xx/integrated_bin200_WM_intra_sagcor_filterout_250610.rds")
+
+# List sections for sagittal and coronal
+sag_slices <- c("533","535","537","538","539","543","548")
+cor_slices <- c('442','443','444','445','447','448','450','451','452','454','455')
+
+seurat_sag <- subset(seurat_obj, slice %in% sag_slices)
+seurat_cor <- subset(seurat_obj, slice %in% cor_slices)
+
+# Keep only fiber tracts present in both sagittal and coronal data
+sag_areas <- table(seurat_sag@meta.data$area)
+cor_areas <- table(seurat_cor@meta.data$area)
+common_areas <- intersect(names(sag_areas), names(cor_areas))
+common_areas <- setdiff(common_areas, "stria_terminalis")  # too few cells
+
+seurat <- subset(seurat_obj, area %in% common_areas)
+
+# 4. Build training data frame (bins × gene expression) -------------------
+seurat <- AddMetaData(seurat, rownames(seurat@meta.data), "CellID")
+
+counts <- as.matrix(seurat@assays$RNA@counts)
+cell_data <- data.frame(
+  CellID = rownames(seurat@meta.data),
+  Sample = seurat@meta.data$orig.ident,
+  CellType = seurat@meta.data$area,   # "optic_tract" or other names
+  t(counts),
+  stringsAsFactors = FALSE
+)
+
+# 5. Feature selection: highly variable genes (variance > 0.5) -----------
+var_threshold <- 0.5
+feature_vars <- apply(cell_data[, 4:ncol(cell_data)], 2, var, na.rm = TRUE)
+high_var_genes <- names(feature_vars[feature_vars > var_threshold])
+cat("Number of high-variance genes:", length(high_var_genes), "\n")
+
+# Retain only genes that are both in the optic DEG list and high-variance
+final_genes <- intersect(optic_genes, high_var_genes)
+cat("Final number of features (DEG ∩ high-var):", length(final_genes), "\n")
+
+cell_data <- cell_data[, c("CellID", "Sample", "CellType", final_genes)]
+
+# 6. Split into training (80%) and test (20%) sets ------------------------
+set.seed(123)
+train_idx <- createDataPartition(cell_data$CellType, p = 0.8, list = FALSE)
+train_data <- cell_data[train_idx, ]
+test_data  <- cell_data[-train_idx, ]
+
+cat("Training set class distribution:\n")
+print(prop.table(table(train_data$CellType)))
+cat("\nTest set class distribution:\n")
+print(prop.table(table(test_data$CellType)))
+
+# 7. Define evaluation function -------------------------------------------
+calculate_metrics <- function(predictions, true_labels, dataset_name = "Dataset") {
+  cat("=== Debug:", dataset_name, "===\n")
+  cat("Prediction range:", range(predictions), "\n")
+  cat("True label distribution:", table(true_labels), "\n")
+  
+  true_numeric <- ifelse(true_labels == "Positive", 1, 0)
+  pred_class   <- ifelse(predictions > 0.5, 1, 0)
+  
+  acc  <- Accuracy(pred_class, true_numeric)
+  f1   <- F1_Score(true_numeric, pred_class)
+  auc_val <- AUC(predictions, true_numeric)
+  aupr <- PRAUC(predictions, true_numeric)
+  
+  cat("Accuracy:", acc, "  F1-score:", f1, "  AUC:", auc_val, "  AUPR:", aupr, "\n\n")
+  
+  return(c(Accuracy = acc, F1_Score = f1, AUC = auc_val, AUPR = aupr))
+}
+
+# 8. Train binary random forest for optic tract (One-vs-Rest) ------------
+target_type <- "optic_tract"
+cat("\n===== Training model for:", target_type, " (vs Others) =====\n")
+
+# Create binary labels
+train_data$BinaryLabel <- factor(ifelse(train_data$CellType == target_type, "Positive", "Negative"))
+test_data$BinaryLabel  <- factor(ifelse(test_data$CellType == target_type, "Positive", "Negative"))
+
+# Handle class imbalance by upsampling
+set.seed(123)
+balanced_train <- upSample(
+  x = train_data[, final_genes],
+  y = train_data$BinaryLabel,
+  yname = "BinaryLabel"
+)
+# upSample returns a data frame; add back metadata columns if needed
+balanced_train <- cbind(
+  balanced_train,
+  train_data[as.numeric(rownames(balanced_train)), c("CellID", "Sample", "CellType")]
+)
+
+# Train random forest
+set.seed(123)
+rf_model <- randomForest(
+  BinaryLabel ~ .,
+  data = balanced_train[, -which(colnames(balanced_train) %in% c("CellID", "Sample", "CellType", "BinaryLabel"))],
+  ntree = 1000,
+  mtry = floor(sqrt(length(final_genes))),
+  importance = TRUE,
+  do.trace = 100
+)
+
+# Predictions
+train_pred <- predict(rf_model, newdata = train_data[, final_genes], type = "prob")
+test_pred  <- predict(rf_model, newdata = test_data[, final_genes], type = "prob")
+
+# ROC and AUC
+roc_obj <- roc(test_data$BinaryLabel, test_pred[, "Positive"])
+auc_val <- auc(roc_obj)
+cat("Test AUC:", auc_val, "\n")
+
+# Store results
+models <- list(rf_model)
+names(models) <- target_type
+predictions <- list(test_pred)
+names(predictions) <- target_type
+auc_values <- list(auc_val)
+names(auc_values) <- target_type
+roc_curves <- list(roc_obj)
+names(roc_curves) <- target_type
+
+# Evaluate on training and test sets
+metrics_train <- calculate_metrics(train_pred[, "Positive"], train_data$BinaryLabel, "Training Set")
+metrics_test  <- calculate_metrics(test_pred[, "Positive"], test_data$BinaryLabel, "Test Set")
